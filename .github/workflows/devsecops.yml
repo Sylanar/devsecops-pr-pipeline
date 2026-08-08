@@ -1,0 +1,389 @@
+name: DevSecOps PR Pipeline
+
+# Template for application repositories (expects a root Dockerfile and an HTTP
+# app on :3000). Cluster must provide ARC runners labeled "arc-runner-set" and
+# ci-builds RBAC — see README and platform/ci-builds/rbac.yaml.
+
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  # -------------------------------------------------------
+  # 1) SAST — Trivy filesystem scan (non-blocking)
+  # -------------------------------------------------------
+  scan:
+    runs-on: arc-runner-set
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Cleanup Trivy cache
+        if: always()
+        run: rm -rf "${{ github.workspace }}/.trivy-cache" || true
+
+  # -------------------------------------------------------
+  # 2) Build — Kaniko Job in ci-builds → GHCR
+  # -------------------------------------------------------
+  build-and-publish:
+    needs: scan
+    runs-on: arc-runner-set
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CI_NAMESPACE: ci-builds
+      JOB_NAME: kaniko-pr-${{ github.event.number }}-${{ github.run_id }}
+      SECRET_NAME: ghcr-pr-${{ github.event.number }}-${{ github.run_id }}
+
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) KARCH=amd64 ;;
+            aarch64|arm64) KARCH=arm64 ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+          curl -sL "https://dl.k8s.io/release/${VERSION}/bin/linux/${KARCH}/kubectl" -o /tmp/kubectl
+          chmod +x /tmp/kubectl
+          echo "/tmp" >> "$GITHUB_PATH"
+          /tmp/kubectl version --client=true
+
+      - name: Create ephemeral secrets (GHCR + git token)
+        run: |
+          kubectl -n "${CI_NAMESPACE}" create secret docker-registry "${SECRET_NAME}" \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl -n "${CI_NAMESPACE}" create secret generic "${SECRET_NAME}-git" \
+            --from-literal=token="${{ secrets.GITHUB_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Run Kaniko build Job
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          REPO_LOWER=$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_LOWER}:${SHA}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB_NAME}
+            namespace: ${CI_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: kaniko
+              app.kubernetes.io/part-of: devsecops-pipeline
+              github.com/run-id: "${{ github.run_id }}"
+          spec:
+            ttlSecondsAfterFinished: 600
+            backoffLimit: 0
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: kaniko
+              spec:
+                restartPolicy: Never
+                serviceAccountName: kaniko-builder
+                automountServiceAccountToken: false
+                initContainers:
+                  - name: fetch-sources
+                    image: alpine:3.20
+                    command: ["sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        apk add --no-cache wget tar >/dev/null
+                        wget -q -O /tmp/src.tar.gz \
+                          --header="Authorization: Bearer \${GITHUB_TOKEN}" \
+                          --header="Accept: application/vnd.github+json" \
+                          "https://api.github.com/repos/\${REPO}/tarball/\${SHA}"
+                        tar -xzf /tmp/src.tar.gz -C /workspace --strip-components=1
+                        rm -f /tmp/src.tar.gz
+                        ls -la /workspace
+                        test -f /workspace/Dockerfile
+                    env:
+                      - name: GITHUB_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${SECRET_NAME}-git
+                            key: token
+                      - name: REPO
+                        value: "${REPO}"
+                      - name: SHA
+                        value: "${SHA}"
+                    volumeMounts:
+                      - name: workspace
+                        mountPath: /workspace
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=/workspace
+                      - --dockerfile=Dockerfile
+                      - --destination=${IMAGE}
+                      - --snapshot-mode=redo
+                      - --use-new-run
+                      - --cleanup
+                    volumeMounts:
+                      - name: workspace
+                        mountPath: /workspace
+                      - name: docker-config
+                        mountPath: /kaniko/.docker
+                volumes:
+                  - name: workspace
+                    emptyDir: {}
+                  - name: docker-config
+                    secret:
+                      secretName: ${SECRET_NAME}
+                      items:
+                        - key: .dockerconfigjson
+                          path: config.json
+          EOF
+
+          dump_job_debug() {
+            echo "=== Job status ==="
+            kubectl -n "${CI_NAMESPACE}" get job "${JOB_NAME}" -o wide || true
+            echo "=== Pods ==="
+            kubectl -n "${CI_NAMESPACE}" get pods -l job-name="${JOB_NAME}" -o wide || true
+            echo "=== describe job ==="
+            kubectl -n "${CI_NAMESPACE}" describe job "${JOB_NAME}" || true
+            echo "=== logs ==="
+            kubectl -n "${CI_NAMESPACE}" logs "job/${JOB_NAME}" --all-containers=true --prefix=true || true
+            for p in $(kubectl -n "${CI_NAMESPACE}" get pods -l job-name="${JOB_NAME}" -o name 2>/dev/null); do
+              kubectl -n "${CI_NAMESPACE}" describe "$p" || true
+              kubectl -n "${CI_NAMESPACE}" logs "$p" --all-containers=true --prefix=true || true
+            done
+          }
+
+          echo "Waiting for Job ${JOB_NAME}..."
+          DEADLINE=$((SECONDS + 1200))
+          while (( SECONDS < DEADLINE )); do
+            SUCCEEDED=$(kubectl -n "${CI_NAMESPACE}" get job "${JOB_NAME}" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            FAILED=$(kubectl -n "${CI_NAMESPACE}" get job "${JOB_NAME}" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+            SUCCEEDED=${SUCCEEDED:-0}
+            FAILED=${FAILED:-0}
+
+            if [[ "${SUCCEEDED}" -ge 1 ]]; then
+              echo "Image pushed: ${IMAGE}"
+              kubectl -n "${CI_NAMESPACE}" logs "job/${JOB_NAME}" -c kaniko || true
+              exit 0
+            fi
+
+            if [[ "${FAILED}" -ge 1 ]]; then
+              echo "Job ${JOB_NAME} failed"
+              dump_job_debug
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for Job ${JOB_NAME}"
+          dump_job_debug
+          exit 1
+
+      - name: Cleanup Job and secrets
+        if: always()
+        run: |
+          kubectl -n "${CI_NAMESPACE}" delete job "${JOB_NAME}" --ignore-not-found=true
+          kubectl -n "${CI_NAMESPACE}" delete secret "${SECRET_NAME}" "${SECRET_NAME}-git" --ignore-not-found=true
+
+  # -------------------------------------------------------
+  # 3) DAST — ephemeral app + OWASP ZAP baseline
+  # -------------------------------------------------------
+  dast:
+    needs: build-and-publish
+    runs-on: arc-runner-set
+    permissions:
+      contents: read
+      packages: read
+    env:
+      CI_NAMESPACE: ci-builds
+      RUN_ID: ${{ github.run_id }}
+      APP_NAME: dast-app-${{ github.event.number }}-${{ github.run_id }}
+      ZAP_JOB: dast-zap-${{ github.event.number }}-${{ github.run_id }}
+      PULL_SECRET: ghcr-dast-${{ github.event.number }}-${{ github.run_id }}
+
+    steps:
+      - name: Install kubectl
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) KARCH=amd64 ;;
+            aarch64|arm64) KARCH=arm64 ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+          curl -sL "https://dl.k8s.io/release/${VERSION}/bin/linux/${KARCH}/kubectl" -o /tmp/kubectl
+          chmod +x /tmp/kubectl
+          echo "/tmp" >> "$GITHUB_PATH"
+          /tmp/kubectl version --client=true
+
+      - name: Deploy app from GHCR image
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          REPO_LOWER=$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_LOWER}:${SHA}"
+
+          kubectl -n "${CI_NAMESPACE}" create secret docker-registry "${PULL_SECRET}" \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${APP_NAME}
+            namespace: ${CI_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: dast-app
+              app.kubernetes.io/part-of: devsecops-pipeline
+              dast-run: "${RUN_ID}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ${APP_NAME}
+            template:
+              metadata:
+                labels:
+                  app: ${APP_NAME}
+                  dast-run: "${RUN_ID}"
+              spec:
+                imagePullSecrets:
+                  - name: ${PULL_SECRET}
+                automountServiceAccountToken: false
+                containers:
+                  - name: app
+                    image: ${IMAGE}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 3000
+                    readinessProbe:
+                      httpGet:
+                        path: /
+                        port: 3000
+                      initialDelaySeconds: 2
+                      periodSeconds: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${APP_NAME}
+            namespace: ${CI_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: dast-app
+              dast-run: "${RUN_ID}"
+          spec:
+            selector:
+              app: ${APP_NAME}
+            ports:
+              - port: 3000
+                targetPort: 3000
+          EOF
+
+          kubectl -n "${CI_NAMESPACE}" rollout status "deployment/${APP_NAME}" --timeout=180s
+
+      - name: OWASP ZAP baseline scan
+        id: zap
+        continue-on-error: true
+        run: |
+          TARGET="http://${APP_NAME}.${CI_NAMESPACE}.svc.cluster.local:3000/"
+          echo "Scanning target: ${TARGET}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${ZAP_JOB}
+            namespace: ${CI_NAMESPACE}
+            labels:
+              app.kubernetes.io/name: owasp-zap
+              app.kubernetes.io/part-of: devsecops-pipeline
+              dast-run: "${RUN_ID}"
+          spec:
+            ttlSecondsAfterFinished: 600
+            backoffLimit: 0
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: owasp-zap
+                  dast-run: "${RUN_ID}"
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                containers:
+                  - name: zap
+                    image: ghcr.io/zaproxy/zaproxy:stable
+                    command: ["zap-baseline.py"]
+                    args:
+                      - -t
+                      - ${TARGET}
+                      - -I
+          EOF
+
+          dump_zap_debug() {
+            echo "=== ZAP job status ==="
+            kubectl -n "${CI_NAMESPACE}" get job "${ZAP_JOB}" -o wide || true
+            echo "=== ZAP logs ==="
+            kubectl -n "${CI_NAMESPACE}" logs "job/${ZAP_JOB}" --all-containers=true --prefix=true || true
+          }
+
+          echo "Waiting for ZAP Job ${ZAP_JOB}..."
+          DEADLINE=$((SECONDS + 900))
+          while (( SECONDS < DEADLINE )); do
+            SUCCEEDED=$(kubectl -n "${CI_NAMESPACE}" get job "${ZAP_JOB}" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            FAILED=$(kubectl -n "${CI_NAMESPACE}" get job "${ZAP_JOB}" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+            SUCCEEDED=${SUCCEEDED:-0}
+            FAILED=${FAILED:-0}
+
+            if [[ "${SUCCEEDED}" -ge 1 ]]; then
+              echo "ZAP baseline completed"
+              dump_zap_debug
+              exit 0
+            fi
+
+            if [[ "${FAILED}" -ge 1 ]]; then
+              echo "ZAP baseline failed or reported findings"
+              dump_zap_debug
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for ZAP Job"
+          dump_zap_debug
+          exit 1
+
+      - name: Cleanup DAST resources
+        if: always()
+        run: |
+          kubectl -n "${CI_NAMESPACE}" delete job "${ZAP_JOB}" --ignore-not-found=true
+          kubectl -n "${CI_NAMESPACE}" delete deployment,service -l "dast-run=${RUN_ID}" --ignore-not-found=true
+          kubectl -n "${CI_NAMESPACE}" delete secret "${PULL_SECRET}" --ignore-not-found=true
+          kubectl -n "${CI_NAMESPACE}" delete pods -l "dast-run=${RUN_ID}" --ignore-not-found=true

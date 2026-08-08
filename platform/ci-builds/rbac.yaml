@@ -1,0 +1,89 @@
+# Reference copy of CI RBAC for documentation only.
+# Source of truth: azure-rancher-k3s-lab/manifests/ci-builds-rbac.yaml
+# Applied by lab playbook: ansible/playbooks/install-arc.yml
+#
+# ARC runner SA (scale set release "arc-runner-set" in ns arc-runners):
+#   system:serviceaccount:arc-runners:arc-runner-set-gha-rs-no-permission
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ci-builds
+  labels:
+    app.kubernetes.io/name: ci-builds
+    app.kubernetes.io/part-of: devsecops-pipeline
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-runner
+  namespace: ci-builds
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kaniko-builder
+  namespace: ci-builds
+automountServiceAccountToken: false
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-runner
+  namespace: ci-builds
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "delete", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get"]
+    resourceNames: ["kaniko-builder"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-runner
+  namespace: ci-builds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ci-runner
+subjects:
+  - kind: ServiceAccount
+    name: ci-runner
+    namespace: ci-builds
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arc-runner-ci-builds
+  namespace: ci-builds
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ci-runner
+subjects:
+  - kind: ServiceAccount
+    name: arc-runner-set-gha-rs-no-permission
+    namespace: arc-runners
